@@ -1,0 +1,26 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-wheel-metadata/
+.installed.cfg
+*.egg-info/
+
+# IDE configuration
+.idea/
+.vscode/
+
+# Generated files and data
+*.db
+*.pkl
+*.log
+*.png
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db
