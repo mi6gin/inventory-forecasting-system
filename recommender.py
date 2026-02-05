@@ -7,9 +7,29 @@ from datetime import date, timedelta, datetime
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.piecharts import Pie
 
+import torch
+import torch.nn as nn
+
+# Define a simple Neural Network (must match the one in model_trainer.py)
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size):
+        super(NeuralNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        x = self.fc3(x)
+        return x
+
 # --- Константы ---
 DB_NAME = "inventory_forecast.db"
-MODEL_PATH = "demand_model.pkl"
+MODEL_PATH = "demand_model.pth"
 SCALER_PATH = "demand_scaler.pkl"
 N_LAGS = 35 # Должно совпадать с model_trainer.py
 SAFETY_STOCK_FACTOR = 0.20  # 20% страховой запас
@@ -97,8 +117,14 @@ def main():
     # 1. Загрузка артефактов и данных
     print("4.1. Загрузка модели, скейлера и данных из БД...")
     try:
-        model = joblib.load(MODEL_PATH)
+        # Determine input size for the Neural Network from the scaler
+        # We need to load scaler first to get the feature count
         scaler = joblib.load(SCALER_PATH)
+        input_size = scaler.n_features_in_ # Get input features count from the scaler
+
+        model = NeuralNetwork(input_size)
+        model.load_state_dict(torch.load(MODEL_PATH))
+        model.eval() # Set model to evaluation mode
     except FileNotFoundError:
         print(f"Ошибка: Не найдены файлы '{MODEL_PATH}' или '{SCALER_PATH}'.")
         print("Сначала запустите 'model_trainer.py' для обучения модели.")
@@ -131,8 +157,12 @@ def main():
 
         # Масштабирование и прогноз
         features_scaled = scaler.transform(features_df)
-        predicted_demand = model.predict(features_scaled)[0]
+        features_tensor = torch.tensor(features_scaled, dtype=torch.float32)
+        with torch.no_grad():
+            predicted_demand_tensor = model(features_tensor)
+            predicted_demand = predicted_demand_tensor.item()
         predicted_demand = max(0, predicted_demand)
+
         
         # Текущий остаток
         current_stock = stock_df[stock_df['product_id'] == pid]['current_quantity'].iloc[0]

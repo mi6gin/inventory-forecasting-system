@@ -3,7 +3,27 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# Define a simple Neural Network
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size):
+        super(NeuralNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        x = self.fc3(x)
+        return x
+
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import joblib
 import warnings
@@ -12,7 +32,7 @@ warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 # --- Константы ---
 DB_NAME = "inventory_forecast.db"
-MODEL_PATH = "demand_model.pkl"
+MODEL_PATH = "demand_model.pth"
 SCALER_PATH = "demand_scaler.pkl"
 N_LAGS = 35 # Увеличим глубину лагов для лучшего захвата зависимостей
 
@@ -163,18 +183,55 @@ def main():
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    print("2.3. Обучение модели RandomForestRegressor...")
-    # Используем RandomForest, т.к. TensorFlow недоступен
-    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1, max_depth=20, min_samples_leaf=5)
-    model.fit(X_train_scaled, y_train)
+    print("2.3. Обучение нейронной сети PyTorch...")
     
+    # Конвертация данных в тензоры PyTorch
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1) # unsqueeze для правильной формы
+
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).unsqueeze(1)
+    
+    # Инициализация модели, функции потерь и оптимизатора
+    input_size = X_train_tensor.shape[1]
+    model = NeuralNetwork(input_size)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Обучение модели
+    num_epochs = 100 # Количество эпох, можно настроить
+    batch_size = 64 # Размер батча, можно настроить
+
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(num_epochs):
+        model.train() # Устанавливаем модель в режим обучения
+        for i, (inputs, labels) in enumerate(train_loader):
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        if (epoch+1) % 10 == 0:
+            print (f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+
     print("2.4. Сохранение модели и скейлера...")
-    joblib.dump(model, MODEL_PATH)
+    # Сохраняем только состояние модели (state_dict)
+    torch.save(model.state_dict(), MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
 
     # 3. Оценка качества
     print("\n--- Этап 3: Оценка качества модели ---")
-    predictions = model.predict(X_test_scaled)
+    model.eval() # Устанавливаем модель в режим оценки
+    with torch.no_grad():
+        predictions_tensor = model(X_test_tensor)
+        predictions = predictions_tensor.numpy().flatten()
+
     
     mae = mean_absolute_error(y_test, predictions)
     rmse = np.sqrt(mean_squared_error(y_test, predictions))
