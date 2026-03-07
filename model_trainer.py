@@ -2,259 +2,158 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
-# Define a simple Neural Network
-class NeuralNetwork(nn.Module):
-    def __init__(self, input_size):
-        super(NeuralNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_size, 128)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 1)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        x = self.relu(x)
-        x = self.fc3(x)
-        return x
-
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import joblib
 import warnings
+import os
+from losses import MultiQuantileLoss
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-# --- Константы ---
 DB_NAME = "inventory_forecast.db"
 MODEL_PATH = "demand_model.pth"
 SCALER_PATH = "demand_scaler.pkl"
-N_LAGS = 35 # Увеличим глубину лагов для лучшего захвата зависимостей
+N_LAGS = 35 
+QUANTILES = [0.1, 0.5, 0.9]
 
-def load_and_prepare_data(db_name):
-    """Загружает и объединяет данные из SQLite."""
-    with sqlite3.connect(db_name) as conn:
-        sales_df = pd.read_sql_query("SELECT product_id, sale_date, quantity_sold FROM sales_history", conn, parse_dates=['sale_date'])
-        products_df = pd.read_sql_query("SELECT id as product_id, lead_time FROM products", conn)
-    
-    # Объединяем данные
-    df = pd.merge(sales_df, products_df, on='product_id')
-    df = df.set_index('sale_date').sort_index()
+class LSTMForecaster(nn.Module):
+    def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
+        super(LSTMForecaster, self).__init__()
+        # Вход для LSTM: (batch, seq_len, 1) - только история продаж
+        self.lstm = nn.LSTM(input_size=1, hidden_size=64, num_layers=1, batch_first=True)
+        
+        # Полносвязная сеть объединяет выход LSTM и остальные (экзогенные) признаки
+        self.fc = nn.Sequential(
+            nn.Linear(64 + num_static_features, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_quantiles)
+        )
+
+    def forward(self, lags, static_features):
+        lstm_out, _ = self.lstm(lags.unsqueeze(-1))
+        last_hidden = lstm_out[:, -1, :]
+        combined = torch.cat((last_hidden, static_features), dim=1)
+        return torch.relu(self.fc(combined))
+
+def add_temporal_features(df):
+    df['day_sin'] = np.sin(2 * np.pi * df.index.dayofyear / 365.25)
+    df['day_cos'] = np.cos(2 * np.pi * df.index.dayofyear / 365.25)
+    df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
+    df['is_weekend'] = (df.index.dayofweek >= 5).astype(int)
     return df
 
-def clean_data(df):
-    """
-    Выполняет очистку данных.
-    (В этой реализации - заглушка, т.к. данные синтетические)
-    """
-    # Пример: удаление выбросов по методу межквартильного размаха
-    # Q1 = df['quantity_sold'].quantile(0.25)
-    # Q3 = df['quantity_sold'].quantile(0.75)
-    # IQR = Q3 - Q1
-    # lower_bound = Q1 - 1.5 * IQR
-    # upper_bound = Q3 + 1.5 * IQR
-    # df = df[(df['quantity_sold'] >= lower_bound) & (df['quantity_sold'] <= upper_bound)]
+def load_and_prepare_data(db_name):
+    with sqlite3.connect(db_name) as conn:
+        sales_df = pd.read_sql_query("SELECT product_id, sale_date, quantity_sold, in_stock, is_holiday, is_promo FROM sales_history", conn, parse_dates=['sale_date'])
+        products_df = pd.read_sql_query("SELECT id as product_id, category, lead_time FROM products", conn)
     
-    # Заполнение пропусков (если они есть)
-    df['quantity_sold'] = df['quantity_sold'].ffill()
+    df = pd.merge(sales_df, products_df, on='product_id')
+    df = df.set_index('sale_date').sort_index()
+    
+    cat_dummies = pd.get_dummies(df['category'], prefix='cat')
+    df = pd.concat([df, cat_dummies], axis=1)
     return df
 
 def create_features_and_target(df):
-    """Создает признаки (скользящее окно) и динамическую целевую переменную."""
+    df['quantity_sold_log'] = np.log1p(df['quantity_sold'])
     
-    # Создание признаков
     for i in range(1, N_LAGS + 1):
-        df[f'lag_{i}'] = df.groupby('product_id')['quantity_sold'].shift(i)
+        df[f'lag_{i}'] = df.groupby('product_id')['quantity_sold_log'].shift(i)
     
-    df['rolling_mean_7'] = df.groupby('product_id')['quantity_sold'].shift(1).rolling(window=7, min_periods=1).mean()
-    df['rolling_mean_30'] = df.groupby('product_id')['quantity_sold'].shift(1).rolling(window=30, min_periods=1).mean()
+    df['rolling_mean_7'] = df.groupby('product_id')['quantity_sold_log'].shift(1).rolling(window=7).mean()
+    df['rolling_std_7'] = df.groupby('product_id')['quantity_sold_log'].shift(1).rolling(window=7).std()
     
-    df['day_of_week'] = df.index.dayofweek
-    df['month'] = df.index.month
-    df['year'] = df.index.year
-    df['day_of_year'] = df.index.dayofyear
-
-    # Создание динамической целевой переменной
-    # Горизонт прогноза = lead_time
+    df = add_temporal_features(df)
+    
     target_list = []
     for pid, group in df.groupby('product_id'):
-        lead_time = group['lead_time'].iloc[0]
-        # Сумма продаж за будущий период, равный lead_time
-        group['target'] = group['quantity_sold'].shift(-lead_time).rolling(window=lead_time).sum()
+        lt = group['lead_time'].iloc[0]
+        target_sum = group['quantity_sold'].shift(-lt).rolling(window=lt).sum()
+        group['target'] = np.log1p(target_sum)
         target_list.append(group)
     
-    featured_df = pd.concat(target_list)
-    featured_df = featured_df.dropna() # Удаляем строки, где признаки или цель не могут быть вычислены
-    
+    featured_df = pd.concat(target_list).dropna()
     return featured_df
 
-def mean_absolute_percentage_error(y_true, y_pred): 
-    """Расчет MAPE"""
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    # Избегаем деления на ноль
-    mask = y_true != 0
-    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-
-def create_enhanced_performance_chart(y_test, predictions, mae, rmse, mape):
-    """
-    Создает улучшенный и более понятный график оценки производительности модели.
-    """
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(12, 12))
-
-    # --- Основной график ---
-    ax.scatter(y_test, predictions, alpha=0.5, label="Точки прогнозов")
-    
-    # --- Линия идеального прогноза ---
-    perfect_line_range = [min(y_test.min(), predictions.min()), max(y_test.max(), predictions.max())]
-    ax.plot(perfect_line_range, perfect_line_range, '--', color='red', lw=2, label="Идеальный прогноз")
-
-    # --- Зоны ошибок ---
-    ax.fill_between(perfect_line_range, perfect_line_range, perfect_line_range[1], color='orange', alpha=0.2, label="Зона переоценки (риск излишков)")
-    ax.fill_between(perfect_line_range, perfect_line_range, perfect_line_range[0], color='blue', alpha=0.2, label="Зона недооценки (риск дефицита)")
-
-    # --- Аннотации и текст ---
-    ax.set_xlabel("Фактический спрос (сумма продаж за время поставки)", fontsize=12)
-    ax.set_ylabel("Предсказанный спрос", fontsize=12)
-    ax.set_title("Анализ точности модели: Где модель ошибается?", fontsize=16, fontweight='bold')
-    
-    # Текстовый блок с пояснениями
-    explanation_text = (
-        "КАК ЧИТАТЬ ГРАФИК:\n"
-        "  - Каждая точка - это один прогноз для одного товара.\n"
-        "  - Красная линия (---) - это идеальный прогноз, где предсказание = факт.\n"
-        "  - Точки в ОРАНЖЕВОЙ зоне: модель предсказала больше, чем продали (риск излишков).\n"
-        "  - Точки в СИНЕЙ зоне: модель предсказала меньше, чем продали (риск дефицита)."
-    )
-    ax.text(0.05, 0.95, explanation_text, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
-
-    # Текстовый блок с метриками
-    metrics_text = (
-        f"Ключевые метрики:\n"
-        f"  - MAE: {mae:.2f} (средняя ошибка в штуках)\n"
-        f"  - MAPE: {mape:.2f}% (средняя ошибка в %)"
-    )
-    ax.text(0.65, 0.15, metrics_text, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=dict(boxstyle='round,pad=0.5', fc='lightblue', alpha=0.5))
-    
-    ax.legend(loc='lower right')
-    ax.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('model_performance_enhanced.png')
-    plt.close(fig)
-
 def main():
-    """Основной пайплайн обучения модели."""
-    print("--- Этап 2: Обучение модели ---")
-    
-    # 1. Загрузка и предобработка
-    print("1.1. Загрузка и объединение данных...")
+    print("--- Этап 2: Обучение LSTM модели (С нуля) ---")
     df = load_and_prepare_data(DB_NAME)
-    
-    print("1.2. Очистка данных (пропуски, выбросы)...")
-    df = clean_data(df)
-    
-    print("1.3. Создание признаков и динамической целевой переменной...")
     featured_df = create_features_and_target(df)
     
-    # 2. Обучение модели
-    print("2.1. Подготовка выборок для обучения...")
-    features = [col for col in featured_df.columns if 'lag_' in col or 'rolling_' in col or 'day_' in col or 'month' in col or 'year' in col]
-    X = featured_df[features]
-    y = featured_df['target']
+    # ЛАГИ: от старого к новому для временного ряда LSTM
+    lag_cols = [f'lag_{i}' for i in range(N_LAGS, 0, -1)]
+    # ОСТАЛЬНОЕ: экзогенные факторы
+    static_cols = [c for c in featured_df.columns if 'rolling_' in c or 'sin' in c or 'cos' in c or 'is_' in c or 'cat_' in c or c == 'in_stock']
     
-    # Разделение на обучающую и тестовую выборки (последние 9 месяцев - тест)
-    split_date = featured_df.index.max() - pd.DateOffset(months=9)
-    X_train, y_train = X[X.index <= split_date], y[y.index <= split_date]
-    X_test, y_test = X[X.index > split_date], y[y.index > split_date]
-
-    print(f"  - Размер обучающей выборки: {len(X_train)} записей")
-    print(f"  - Размер тестовой выборки: {len(X_test)} записей")
+    feature_cols = lag_cols + static_cols
+    X, y = featured_df[feature_cols], featured_df['target']
     
-    print("2.2. Масштабирование признаков...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    split_date = featured_df.index.max() - pd.DateOffset(days=30)
     
-    print("2.3. Обучение нейронной сети PyTorch...")
-    
-    # Конвертация данных в тензоры PyTorch
-    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1) # unsqueeze для правильной формы
-
-    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
-    y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).unsqueeze(1)
-    
-    # Инициализация модели, функции потерь и оптимизатора
-    input_size = X_train_tensor.shape[1]
-    model = NeuralNetwork(input_size)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # Обучение модели
-    num_epochs = 100 # Количество эпох, можно настроить
-    batch_size = 64 # Размер батча, можно настроить
-
-    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
-
-    for epoch in range(num_epochs):
-        model.train() # Устанавливаем модель в режим обучения
-        for i, (inputs, labels) in enumerate(train_loader):
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        
-        if (epoch+1) % 10 == 0:
-            print (f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
-
-    print("2.4. Сохранение модели и скейлера...")
-    # Сохраняем только состояние модели (state_dict)
-    torch.save(model.state_dict(), MODEL_PATH)
+    scaler = RobustScaler()
+    X_train_scaled = scaler.fit_transform(X[X.index <= split_date])
+    X_test_scaled = scaler.transform(X[X.index > split_date])
     joblib.dump(scaler, SCALER_PATH)
 
-    # 3. Оценка качества
-    print("\n--- Этап 3: Оценка качества модели ---")
-    model.eval() # Устанавливаем модель в режим оценки
+    X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
+    y_train_t = torch.tensor(y[y.index <= split_date].values, dtype=torch.float32).unsqueeze(1)
+    X_test_t = torch.tensor(X_test_scaled, dtype=torch.float32)
+    y_test_t = torch.tensor(y[y.index > split_date].values, dtype=torch.float32).unsqueeze(1)
+    
+    num_lags = len(lag_cols)
+    num_static = len(static_cols)
+    
+    model = LSTMForecaster(num_static_features=num_static)
+    criterion = MultiQuantileLoss(quantiles=QUANTILES)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_train_t, y_train_t), batch_size=128, shuffle=True
+    )
+
+    epochs = 40
+    print("Начинаем обучение LSTM...")
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0
+        for b_x, b_y in train_loader:
+            lags = b_x[:, :num_lags]
+            static = b_x[:, num_lags:]
+            
+            optimizer.zero_grad()
+            loss = criterion(model(lags, static), b_y)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        if (epoch+1) % 10 == 0: 
+            print(f"  Эпоха {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_loader):.6f}")
+
+    torch.save(model.state_dict(), MODEL_PATH)
+
+    print("\n--- Этап 3: Анализ качества ---")
+    model.eval()
     with torch.no_grad():
-        predictions_tensor = model(X_test_tensor)
-        predictions = predictions_tensor.numpy().flatten()
-
+        lags_test = X_test_t[:, :num_lags]
+        static_test = X_test_t[:, num_lags:]
+        preds_log = model(lags_test, static_test).numpy()
+        preds_real = np.expm1(preds_log)
+        y_test_real = np.expm1(y_test_t.numpy())
     
-    mae = mean_absolute_error(y_test, predictions)
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    mape = mean_absolute_percentage_error(y_test, predictions)
-    
-    print(f"  - MAE (Mean Absolute Error): {mae:.2f}")
-    print(f"  - RMSE (Root Mean Squared Error): {rmse:.2f}")
-    print(f"  - MAPE (Mean Absolute Percentage Error): {mape:.2f}%")
-    
-    print("3.1. Построение графика 'Прогноз vs. Факт'...")
-    plt.figure(figsize=(10, 10))
-    plt.scatter(y_test, predictions, alpha=0.3)
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], '--', color='red', lw=2)
-    plt.xlabel('Фактические значения (сумма продаж за lead_time)')
-    plt.ylabel('Предсказанные значения')
-    plt.title('Оценка качества модели: Прогноз vs. Факт')
-    plt.grid(True)
-    plt.savefig('model_performance.png')
-    print("  - График сохранен в 'model_performance.png'")
-
-    print("3.2. Построение УЛУЧШЕННОГО графика 'Прогноз vs. Факт'...")
-    create_enhanced_performance_chart(y_test, predictions, mae, rmse, mape)
-    print("  - Улучшенный график сохранен в 'model_performance_enhanced.png'")
+    r2_val = r2_score(y_test_real, preds_real[:, 1])
+    mae_val = mean_absolute_error(y_test_real, preds_real[:, 1])
+    print(f"  - R-squared (медиана): {r2_val:.4f}")
+    print(f"  - MAE (средняя ошибка в штуках): {mae_val:.2f}")
 
 if __name__ == '__main__':
     main()
