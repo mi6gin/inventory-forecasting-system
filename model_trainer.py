@@ -76,9 +76,7 @@ def create_features_and_target(df):
     
     target_list = []
     for pid, group in df.groupby('product_id'):
-        lt = group['lead_time'].iloc[0]
-        target_sum = group['quantity_sold'].shift(-lt).rolling(window=lt).sum()
-        group['target'] = np.log1p(target_sum)
+        group['target'] = np.log1p(group['quantity_sold'].shift(-1))
         target_list.append(group)
     
     featured_df = pd.concat(target_list).dropna()
@@ -95,14 +93,32 @@ def main():
     static_cols = [c for c in featured_df.columns if 'rolling_' in c or 'sin' in c or 'cos' in c or 'is_' in c or 'cat_' in c or c == 'in_stock']
     
     feature_cols = lag_cols + static_cols
+    continuous_cols = lag_cols + ['rolling_mean_7', 'rolling_std_7']
+    binary_cols = [c for c in static_cols if c not in ['rolling_mean_7', 'rolling_std_7']]
+
     X, y = featured_df[feature_cols], featured_df['target']
     
     split_date = featured_df.index.max() - pd.DateOffset(days=30)
     
     scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X[X.index <= split_date])
-    X_test_scaled = scaler.transform(X[X.index > split_date])
-    joblib.dump(scaler, SCALER_PATH)
+    X_train_cont = scaler.fit_transform(X.loc[X.index <= split_date, continuous_cols])
+    X_test_cont = scaler.transform(X.loc[X.index > split_date, continuous_cols])
+    
+    scaler_data = {
+        'scaler': scaler,
+        'feature_names': feature_cols,
+        'continuous_cols': continuous_cols,
+        'binary_cols': binary_cols
+    }
+    joblib.dump(scaler_data, SCALER_PATH)
+
+    X_train_scaled = X.loc[X.index <= split_date].copy().values.astype(np.float32)
+    X_test_scaled = X.loc[X.index > split_date].copy().values.astype(np.float32)
+    
+    cont_indices = [feature_cols.index(c) for c in continuous_cols]
+    for i, idx in enumerate(cont_indices):
+        X_train_scaled[:, idx] = X_train_cont[:, i]
+        X_test_scaled[:, idx] = X_test_cont[:, i]
 
     X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
     y_train_t = torch.tensor(y[y.index <= split_date].values, dtype=torch.float32).unsqueeze(1)

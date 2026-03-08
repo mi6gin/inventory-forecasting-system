@@ -49,6 +49,7 @@ def main():
             
             base_demand = np.random.randint(20, 100)
             oos_days_remaining = 0
+            records = []
 
             for d in range(days):
                 curr_date = start_date + timedelta(days=d)
@@ -81,8 +82,9 @@ def main():
                     demand = base_demand * season_factor * day_factor * holiday_factor * promo_factor
                     quantity_sold = np.random.poisson(demand)
                     
-                cursor.execute("INSERT INTO sales_history VALUES (?,?,?,?,?,?)", 
-                               (product_id, curr_date.date(), quantity_sold, in_stock, is_holiday, is_promo))
+                records.append((product_id, curr_date.date(), quantity_sold, in_stock, is_holiday, is_promo))
+            
+            cursor.executemany("INSERT INTO sales_history VALUES (?,?,?,?,?,?)", records)
             
             cursor.execute("INSERT INTO warehouse_stock VALUES (?,?)", (product_id, np.random.randint(100, 500)))
             product_id += 1
