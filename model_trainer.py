@@ -25,6 +25,15 @@ QUANTILES = [0.1, 0.5, 0.9]
 def wape_score(y_true, y_pred):
     return np.sum(np.abs(y_true - y_pred)) / (np.sum(y_true) + 1e-9) * 100
 
+def mae_score(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+def rmse_score(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred)**2))
+
+def mape_score(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / (y_true + 1e-9))) * 100
+
 def recover_oos_demand(df):
     df = df.copy()
     df['recovered_demand'] = pd.to_numeric(df['quantity_sold'], errors='coerce').fillna(0).astype(float)
@@ -49,27 +58,39 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0)) 
     def forward(self, x): return x + self.pe[:, :x.size(1), :]
 
-class LSTMForecaster(nn.Module):
+class BaseForecaster(nn.Module):
+    def _build_head(self, in_features, num_quantiles):
+        return nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_quantiles)
+        )
+
+class LSTMForecaster(BaseForecaster):
     def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
         super(LSTMForecaster, self).__init__()
         self.lstm = nn.LSTM(input_size=1, hidden_size=64, num_layers=1, batch_first=True)
-        self.fc = nn.Sequential(nn.Linear(64 + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
+        self.fc = self._build_head(64 + num_static_features, num_quantiles)
     def forward(self, lags, static_features):
         lstm_out, _ = self.lstm(lags.unsqueeze(-1))
         combined = torch.cat((lstm_out[:, -1, :], static_features), dim=1)
         return torch.relu(self.fc(combined))
 
-class GRUForecaster(nn.Module):
+class GRUForecaster(BaseForecaster):
     def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
         super(GRUForecaster, self).__init__()
         self.gru = nn.GRU(input_size=1, hidden_size=64, num_layers=1, batch_first=True)
-        self.fc = nn.Sequential(nn.Linear(64 + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
+        self.fc = self._build_head(64 + num_static_features, num_quantiles)
     def forward(self, lags, static_features):
         gru_out, _ = self.gru(lags.unsqueeze(-1))
         combined = torch.cat((gru_out[:, -1, :], static_features), dim=1)
         return torch.relu(self.fc(combined))
 
-class TransformerForecaster(nn.Module):
+class TransformerForecaster(BaseForecaster):
     def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
         super(TransformerForecaster, self).__init__()
         self.d_model = 64
@@ -77,11 +98,13 @@ class TransformerForecaster(nn.Module):
         self.pos_encoder = PositionalEncoding(self.d_model)
         encoder_layers = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, dim_feedforward=128, dropout=0.1, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=2)
-        self.fc = nn.Sequential(nn.Linear(self.d_model + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
+        self.fc = self._build_head(self.d_model + num_static_features, num_quantiles)
     def forward(self, lags, static_features):
         src = self.pos_encoder(self.feature_proj(lags.unsqueeze(-1)))
         output = self.transformer_encoder(src)
-        combined = torch.cat((output[:, -1, :], static_features), dim=1)
+        # Use Global Average Pooling instead of just the last token
+        pooled_output = output.mean(dim=1)
+        combined = torch.cat((pooled_output, static_features), dim=1)
         return torch.relu(self.fc(combined))
 
 def load_and_prepare_data(db_name):
@@ -111,7 +134,7 @@ def create_features_and_target(df):
 
 def train_neural_model(model_class, X_data, y_data, num_lags, num_static, continuous_cols, feature_cols, epochs=30):
     tscv = TimeSeriesSplit(n_splits=3)
-    fold_wapes = []
+    fold_metrics = {"WAPE": [], "MAE": [], "RMSE": [], "MAPE": []}
     last_model, last_scaler = None, None
     for _, (train_idx, test_idx) in enumerate(tscv.split(X_data)):
         X_train, X_test = X_data.iloc[train_idx], X_data.iloc[test_idx]
@@ -140,9 +163,16 @@ def train_neural_model(model_class, X_data, y_data, num_lags, num_static, contin
         model.eval()
         with torch.no_grad():
             preds_log = model(X_test_t[:, :num_lags], X_test_t[:, num_lags:]).numpy()[:, 1]
-            fold_wapes.append(wape_score(np.expm1(y_test.values), np.expm1(preds_log)))
+            y_true = np.expm1(y_test.values)
+            y_pred = np.expm1(preds_log)
+            fold_metrics["WAPE"].append(wape_score(y_true, y_pred))
+            fold_metrics["MAE"].append(mae_score(y_true, y_pred))
+            fold_metrics["RMSE"].append(rmse_score(y_true, y_pred))
+            fold_metrics["MAPE"].append(mape_score(y_true, y_pred))
         last_model, last_scaler = model, scaler
-    return last_model, np.mean(fold_wapes), last_scaler
+    
+    avg_metrics = {k: np.mean(v) for k, v in fold_metrics.items()}
+    return last_model, avg_metrics, last_scaler
 
 def main():
     print("--- Этап 2: Обучение и честное сравнение (Metric: WAPE) ---")
@@ -161,10 +191,13 @@ def main():
     best_wape, best_name, best_obj, best_sc = float('inf'), "", None, None
     for name, m_class in {"LSTM": LSTMForecaster, "GRU": GRUForecaster, "Transformer": TransformerForecaster}.items():
         print(f"Оценка {name}...")
-        m_obj, avg_wape, sc = train_neural_model(m_class, X, y, num_lags, num_static, continuous_cols, feature_cols)
-        results[name] = avg_wape
-        if avg_wape < best_wape: best_wape, best_name, best_obj, best_sc = avg_wape, name, m_obj, sc
-    print("Оценка ARIMA...")
+        m_obj, avg_metrics, sc = train_neural_model(m_class, X, y, num_lags, num_static, continuous_cols, feature_cols)
+        results[name] = avg_metrics
+        print(f"  > WAPE: {avg_metrics['WAPE']:.2f}%, MAE: {avg_metrics['MAE']:.2f}, RMSE: {avg_metrics['RMSE']:.2f}, MAPE: {avg_metrics['MAPE']:.2f}%")
+        if avg_metrics['WAPE'] < best_wape: 
+            best_wape, best_name, best_obj, best_sc = avg_metrics['WAPE'], name, m_obj, sc
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    print("Оценка SARIMA (Seasonal Baseline)...")
     arima_wapes = []
     pids = featured_df['product_id'].unique()
     sample_pids = np.random.choice(pids, size=min(10, len(pids)), replace=False)
@@ -174,15 +207,18 @@ def main():
         test_d = np.expm1(p_df.loc[p_df.index >= test_cutoff_date, 'target'].values)
         if len(train_d) > 20 and len(test_d) > 0:
             try:
-                m_arima = ARIMA(train_d, order=(5,1,0)).fit()
+                # Use SARIMA with weekly seasonality (period 7)
+                m_arima = SARIMAX(train_d, order=(1, 1, 1), seasonal_order=(1, 1, 1, 7)).fit(disp=False)
                 arima_wapes.append(wape_score(test_d, m_arima.forecast(steps=len(test_d))))
             except: continue
-    results["ARIMA"] = np.mean(arima_wapes) if arima_wapes else 100.0
+    results["SARIMA"] = {"WAPE": np.mean(arima_wapes)} if arima_wapes else {"WAPE": 100.0}
     print(f"\n--- Победитель: {best_name} (WAPE: {best_wape:.2f}%) ---")
     torch.save(best_obj.state_dict(), MODEL_PATH)
     joblib.dump({'scaler': best_sc, 'feature_names': feature_cols, 'continuous_cols': continuous_cols, 'best_model_type': best_name, 'best_wape': best_wape}, SCALER_PATH)
-    print("\n" + "="*40 + "\n" + f"{'Модель':<15} | {'Avg WAPE (%)':<10}\n" + "-"*40)
-    for k, v in results.items(): print(f"{k:<15} | {v:<10.2f}")
-    print("="*40)
+    print("\n" + "="*45 + "\n" + f"{'Модель':<15} | {'Avg WAPE (%)':<10}\n" + "-"*45)
+    for k, v in results.items(): 
+        w_val = v['WAPE'] if isinstance(v, dict) else v
+        print(f"{k:<15} | {w_val:<10.2f}")
+    print("="*45)
 
 if __name__ == '__main__': main()

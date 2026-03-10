@@ -24,3 +24,4 @@ pip-wheel-metadata/
 # OS generated files
 .DS_Store
 Thumbs.db
+*.pth
