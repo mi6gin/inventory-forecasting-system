@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from datetime import date, timedelta, datetime
 import torch
 import torch.nn as nn
+import math
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Spacer, Paragraph, Image, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -25,326 +26,128 @@ QUANTILES = [0.1, 0.5, 0.9]
 FORECAST_HORIZON = 30
 COVERAGE_DAYS = 14
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0)) 
+    def forward(self, x): return x + self.pe[:, :x.size(1), :]
+
 class LSTMForecaster(nn.Module):
     def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
         super(LSTMForecaster, self).__init__()
         self.lstm = nn.LSTM(input_size=1, hidden_size=64, num_layers=1, batch_first=True)
-        self.fc = nn.Sequential(
-            nn.Linear(64 + num_static_features, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_quantiles)
-        )
-
+        self.fc = nn.Sequential(nn.Linear(64 + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
     def forward(self, lags, static_features):
         lstm_out, _ = self.lstm(lags.unsqueeze(-1))
-        last_hidden = lstm_out[:, -1, :]
-        combined = torch.cat((last_hidden, static_features), dim=1)
+        combined = torch.cat((lstm_out[:, -1, :], static_features), dim=1)
         return torch.relu(self.fc(combined))
 
-def register_cyrillic_font():
-    font_paths = [
-        ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
-        ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
-        ("/System/Library/Fonts/Helvetica.ttc", None) # Fallback
-    ]
-    for reg_path, bold_path in font_paths:
-        if os.path.exists(reg_path):
-            pdfmetrics.registerFont(TTFont('CyrillicFont', reg_path))
-            if bold_path and os.path.exists(bold_path):
-                pdfmetrics.registerFont(TTFont('CyrillicFont-Bold', bold_path))
-            else:
-                # Если жирного нет, используем обычный как замену
-                pdfmetrics.registerFont(TTFont('CyrillicFont-Bold', reg_path))
-            return 'CyrillicFont'
+class GRUForecaster(nn.Module):
+    def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
+        super(GRUForecaster, self).__init__()
+        self.gru = nn.GRU(input_size=1, hidden_size=64, num_layers=1, batch_first=True)
+        self.fc = nn.Sequential(nn.Linear(64 + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
+    def forward(self, lags, static_features):
+        gru_out, _ = self.gru(lags.unsqueeze(-1))
+        combined = torch.cat((gru_out[:, -1, :], static_features), dim=1)
+        return torch.relu(self.fc(combined))
+
+class TransformerForecaster(nn.Module):
+    def __init__(self, num_static_features, num_quantiles=len(QUANTILES)):
+        super(TransformerForecaster, self).__init__()
+        self.d_model = 64
+        self.feature_proj = nn.Linear(1, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, dim_feedforward=128, dropout=0.1, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=2)
+        self.fc = nn.Sequential(nn.Linear(self.d_model + num_static_features, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, num_quantiles))
+    def forward(self, lags, static_features):
+        src = self.pos_encoder(self.feature_proj(lags.unsqueeze(-1)))
+        output = self.transformer_encoder(src)
+        combined = torch.cat((output[:, -1, :], static_features), dim=1)
+        return torch.relu(self.fc(combined))
+
+def register_font():
+    for p in ["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]:
+        if os.path.exists(p):
+            pdfmetrics.registerFont(TTFont('Cyrillic', p))
+            return 'Cyrillic'
     return 'Helvetica'
 
-def create_future_projection(model, scaler_data, sales_history, start_date, category, all_categories, initial_stock):
-    scaler = scaler_data['scaler']
-    feature_names = scaler_data['feature_names']
-    continuous_cols = scaler_data['continuous_cols']
-    
+def create_projection(model, scaler_data, sales_history, start_date, category, all_categories, initial_stock):
+    scaler, feat_names, cont_cols = scaler_data['scaler'], scaler_data['feature_names'], scaler_data['continuous_cols']
     history = sales_history.tail(N_LAGS).tolist()
     stock_levels = [initial_stock]
-    dates = []
-    daily_q90_list = []
-    
-    curr_date = start_date
-    current_stock = initial_stock
-    
-    lag_cols = [c for c in feature_names if 'lag_' in c]
-    num_lags = len(lag_cols)
-    
-    for day_offset in range(FORECAST_HORIZON):
-        hist_log = np.log1p(history[-N_LAGS:])
-        features = {}
-        
-        # Лаги от старого к новому
-        for i in range(N_LAGS, 0, -1):
-            features[f'lag_{i}'] = hist_log[-i]
-            
-        features['rolling_mean_7'] = np.mean(hist_log[-7:])
-        features['rolling_std_7'] = np.std(hist_log[-7:])
-        
-        doy = curr_date.dayofyear
-        month = curr_date.month
-        features['day_sin'] = np.sin(2 * np.pi * doy / 365.25)
-        features['day_cos'] = np.cos(2 * np.pi * doy / 365.25)
-        features['month_sin'] = np.sin(2 * np.pi * month / 12)
-        features['month_cos'] = np.cos(2 * np.pi * month / 12)
-        features['is_weekend'] = 1 if curr_date.dayofweek >= 5 else 0
-        
-        # Симуляция будущих праздников и акций
-        features['is_holiday'] = 1 if (curr_date.month == 12 and curr_date.day >= 25) or (curr_date.month == 1 and curr_date.day <= 5) else 0
-        
-        # Допустим, мы знаем, что акции будут в начале каждого месяца
-        features['is_promo'] = 1 if curr_date.day <= 5 else 0 
-        
-        # Для прогноза мы ВСЕГДА предполагаем, что товар БУДЕТ на полке, 
-        # иначе модель предскажет ноль продаж, и мы не закажем товар.
-        features['in_stock'] = 1 
-        
-        for cat in all_categories:
-            features[f'cat_{cat}'] = 1 if cat == category else 0
-            
-        feat_df = pd.DataFrame([features])[feature_names]
-        feat_scaled = feat_df.copy()
-        feat_scaled[continuous_cols] = scaler.transform(feat_df[continuous_cols])
-        feat_t = torch.tensor(feat_scaled.values, dtype=torch.float32)
-        
-        lags_t = feat_t[:, :num_lags]
-        static_t = feat_t[:, num_lags:]
-        
+    dates, q50_list, q90_list = [], [], []
+    curr_date, current_stock = start_date, initial_stock
+    num_lags = len([c for c in feat_names if 'lag_' in c])
+    for _ in range(FORECAST_HORIZON):
+        h_log = np.log1p(history[-N_LAGS:])
+        feats = {f'lag_{i}': h_log[-i] for i in range(N_LAGS, 0, -1)}
+        feats['rolling_mean_7'] = np.mean(h_log[-7:]); feats['rolling_std_7'] = np.std(h_log[-7:])
+        feats['day_sin'] = np.sin(2 * np.pi * curr_date.dayofyear / 365.25); feats['day_cos'] = np.cos(2 * np.pi * curr_date.dayofyear / 365.25)
+        feats['is_weekend'] = 1 if curr_date.dayofweek >= 5 else 0; feats['in_stock'] = 1 
+        for cat in all_categories: feats[f'cat_{cat}'] = 1 if cat == category else 0
+        f_df = pd.DataFrame([feats])
+        for col in feat_names: 
+            if col not in f_df.columns: f_df[col] = 0
+        f_df = f_df[feat_names]
+        f_s = f_df.copy(); f_s[cont_cols] = scaler.transform(f_df[cont_cols])
+        f_t = torch.tensor(f_s.values, dtype=torch.float32)
         with torch.no_grad():
-            preds_log = model(lags_t, static_t).numpy()[0]
-        
-        preds = np.expm1(preds_log)
-        daily_q50 = preds[1]
-        daily_q90 = preds[2]
-        
-        current_stock -= daily_q50
-        stock_levels.append(current_stock)
-        daily_q90_list.append(daily_q90)
-        
-        history.append(daily_q50)
-        dates.append(curr_date)
-        curr_date += timedelta(days=1)
-        
-    return dates, stock_levels[1:], daily_q90_list
-
-def plot_inventory_projection(hist_dates, hist_stock, dates, stock_levels, item_name, lead_time, deadline_date):
-    if not os.path.exists(PLOTS_DIR):
-        os.makedirs(PLOTS_DIR)
-
-    plt.figure(figsize=(8, 4))
-    
-    # Объединяем для отрисовки общей линии
-    all_dates = list(hist_dates) + list(dates)
-    all_stock = list(hist_stock) + list(stock_levels)
-    
-    # История
-    plt.plot(hist_dates, hist_stock, color='#7f8c8d', lw=1.5, label='История', linestyle='--')
-    # Прогноз
-    plt.plot(dates, stock_levels, color='#2980b9', lw=2.5, label='Прогноз запаса')
-    
-    # Заливка прогноза (только положительные значения)
-    plt.fill_between(dates, 0, [max(0, s) for s in stock_levels], color='#3498db', alpha=0.2)
-    
-    # Линия нуля
-    plt.axhline(0, color='#c0392b', linestyle='-', lw=1)
-    
-    # Точка обнуления
-    oos_date = None
-    for d, s in zip(dates, stock_levels):
-        if s <= 0:
-            oos_date = d
-            break
-            
-    if oos_date:
-        plt.axvline(oos_date, color='#e74c3c', linestyle='--', alpha=0.7)
-        plt.scatter([oos_date], [0], color='#e74c3c', zorder=5)
-        plt.text(oos_date, max(all_stock)*0.05, ' Обнуление', color='#e74c3c', fontsize=9, fontweight='bold')
-        
-    # Дедлайн заказа
-    if deadline_date:
-        is_past = deadline_date < dates[0]
-        color = '#d35400' if is_past else '#f39c12'
-        label = f'Дедлайн: {deadline_date.strftime("%d.%m")}' + (' (ПРОСРОЧЕНО)' if is_past else '')
-        
-        plt.axvline(deadline_date, color=color, linestyle='-.', lw=2, label=label)
-        if is_past:
-            plt.gca().axvspan(deadline_date, dates[0], color=color, alpha=0.1)
-
-    plt.title(f"Прогноз движения запасов: {item_name}", fontsize=12, fontweight='bold', pad=15)
-    plt.ylabel("Запас (шт.)")
-    plt.grid(True, alpha=0.3, linestyle=':')
-    plt.legend(loc='upper right', fontsize=8, frameon=True, shadow=True)
-    
-    # Настройка осей
-    plt.ylim(min(all_stock) if min(all_stock) < 0 else 0, max(all_stock) * 1.15)
-    plt.xticks(rotation=25, fontsize=8)
-    plt.tight_layout()
-    
-    img_filename = f"proj_{item_name.replace(' ', '_')}.png"
-    img_path = os.path.join(PLOTS_DIR, img_filename)
-    plt.savefig(img_path, dpi=120)
-    plt.close()
-    return img_path
+            preds = np.expm1(model(f_t[:, :num_lags], f_t[:, num_lags:]).numpy()[0])
+        q50, q90 = preds[1], preds[2]
+        current_stock -= q50; stock_levels.append(current_stock)
+        q50_list.append(q50); q90_list.append(q90); history.append(q50); dates.append(curr_date); curr_date += timedelta(days=1)
+    return dates, stock_levels[1:], q50_list, q90_list
 
 def main():
-    print("\n--- Этап 4: Генерация Плана Закупок (Улучшенная визуализация) ---")
-    font_name = register_cyrillic_font()
-    
-    scaler_data = joblib.load(SCALER_PATH)
-    feature_names = scaler_data['feature_names']
-    num_lags = len([c for c in feature_names if 'lag_' in c])
-    num_static = len(feature_names) - num_lags
-    
-    model = LSTMForecaster(num_static_features=num_static)
-    model.load_state_dict(torch.load(MODEL_PATH))
-    model.eval()
-
+    print("\n--- Этап 4: Генерация Плана Закупок (Lead Time Demand & In-Transit) ---")
+    f_name = register_font()
+    if not os.path.exists(SCALER_PATH): return
+    s_data = joblib.load(SCALER_PATH)
+    m_type, m_classes = s_data['best_model_type'], {"LSTM": LSTMForecaster, "GRU": GRUForecaster, "Transformer": TransformerForecaster}
+    num_lags = len([c for c in s_data['feature_names'] if 'lag_' in c])
+    model = m_classes[m_type](len(s_data['feature_names']) - num_lags)
+    model.load_state_dict(torch.load(MODEL_PATH)); model.eval()
     with sqlite3.connect(DB_NAME) as conn:
         products = pd.read_sql_query("SELECT * FROM products", conn)
         sales = pd.read_sql_query("SELECT * FROM sales_history", conn, parse_dates=['sale_date'])
         stock = pd.read_sql_query("SELECT * FROM warehouse_stock", conn)
-
-    prediction_start = sales['sale_date'].max() + timedelta(days=1)
-    all_cats = products['category'].unique().tolist()
-    
-    recommendations = []
-    graphs = []
-
+        try:
+            transit = pd.read_sql_query("SELECT * FROM warehouse_in_transit", conn)
+        except:
+            transit = pd.DataFrame({'product_id': products['id'], 'in_transit_quantity': 0})
+    sales['quantity_sold'] = pd.to_numeric(sales['quantity_sold'], errors='coerce').fillna(0)
+    stock['current_quantity'] = pd.to_numeric(stock['current_quantity'], errors='coerce').fillna(0)
+    transit['in_transit_quantity'] = pd.to_numeric(transit['in_transit_quantity'], errors='coerce').fillna(0)
+    pred_start, all_cats, recs = sales['sale_date'].max() + timedelta(days=1), products['category'].unique().tolist(), []
     for _, prod in products.iterrows():
-        pid = prod['id']
-        name = prod['name']
-        lead_time = prod['lead_time']
-        category = prod['category']
-        
-        prod_sales = sales[sales['product_id'] == pid].set_index('sale_date')['quantity_sold'].sort_index()
-        current_stock = stock[stock['product_id'] == pid]['current_quantity'].iloc[0]
-        
-        # Получаем историю для графика (последние 14 дней)
-        hist_view_days = 14
-        hist_sales = prod_sales.tail(hist_view_days)
-        hist_dates = hist_sales.index
-        
-        # Восстанавливаем исторический остаток (примерно)
-        hist_stock_vals = []
-        temp_stock = current_stock
-        # Идем назад от текущего остатка
-        for s_val in reversed(hist_sales.values):
-            hist_stock_vals.insert(0, temp_stock + s_val)
-            temp_stock += s_val
-        
-        dates, stocks, q90_demands = create_future_projection(
-            model, scaler_data, prod_sales, prediction_start, category, all_cats, current_stock
-        )
-        
-        oos_date = None
-        for d, s in zip(dates, stocks):
-            if s <= 0:
-                oos_date = d
-                break
-                
-        if oos_date:
-            deadline_date = oos_date - timedelta(days=lead_time)
-            status = 'КРИТИЧНО' if deadline_date <= prediction_start else 'ПЛАНОВАЯ'
-        else:
-            deadline_date = None
-            status = 'НОРМА'
-            
-        target_inventory = sum(q90_demands[:lead_time + COVERAGE_DAYS])
-        order_qty = max(0, int(np.ceil(target_inventory - current_stock)))
-        
-        if not oos_date: order_qty = 0
+        pid, name, lt, cat = prod['id'], prod['name'], prod['lead_time'], prod['category']
+        curr_stock = float(stock[stock['product_id'] == pid]['current_quantity'].iloc[0])
+        in_transit = float(transit[transit['product_id'] == pid]['in_transit_quantity'].iloc[0])
+        dates, stocks, q50s, q90s = create_projection(model, s_data, sales[sales['product_id'] == pid].set_index('sale_date')['quantity_sold'], pred_start, cat, all_cats, curr_stock)
+        oos_date = next((d for d, s in zip(dates, stocks) if s <= 0), None)
+        deadline = oos_date - timedelta(days=lt) if oos_date else None
+        window = lt + COVERAGE_DAYS
+        ltd_q50 = sum(q50s[:window])
+        sigmas = [(q90 - q50)/1.28 for q50, q90 in zip(q50s[:window], q90s[:window])]
+        safety_stock = 1.28 * np.sqrt(sum([s**2 for s in sigmas]))
+        target_inv = ltd_q50 + safety_stock
+        order_qty = max(0, int(np.ceil(target_inv - curr_stock - in_transit))) if oos_date else 0
+        recs.append({'Категория': cat[:10], 'Товар': name, 'Остаток': int(curr_stock), 'В пути': int(in_transit), 'Обнуление': oos_date.strftime('%d.%m') if oos_date else '30+ дн', 'Дедлайн': deadline.strftime('%d.%m') if deadline else '-', 'Заказ': f"{order_qty} шт", 'WAPE': f"{s_data['best_wape']:.1f}%", 'Статус': 'КРИТИЧНО' if deadline and deadline <= pred_start else 'НОРМА'})
+    if not os.path.exists(REPORTS_DIR): os.makedirs(REPORTS_DIR)
+    doc_path = os.path.join(REPORTS_DIR, f"Scientific_Report_{datetime.now().strftime('%d_%m_%H_%M')}.pdf")
+    doc = SimpleDocTemplate(doc_path, pagesize=landscape(letter))
+    elements = [Paragraph(f"НАУЧНО-ОБОСНОВАННЫЙ ПЛАН ЗАКУПОК (Model: {m_type})", getSampleStyleSheet()['Heading1']), Spacer(1, 12)]
+    df_recs = pd.DataFrame(recs); t = Table([df_recs.columns.tolist()] + df_recs.values.tolist())
+    t.setStyle(TableStyle([('FONTNAME', (0,0), (-1,-1), f_name), ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2c3e50')), ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke), ('GRID', (0,0), (-1,-1), 0.5, colors.grey), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('FONTSIZE', (0,0), (-1,-1), 8)]))
+    elements.append(t); doc.build(elements)
+    print(f"Научный отчет сформирован: {doc_path}")
 
-        recommendations.append({
-            'Категория': category[:15],
-            'Товар': name,
-            'Остаток': int(current_stock),
-            'Склад пуст': oos_date.strftime('%d.%m') if oos_date else '30+ дн',
-            'Заказать до': deadline_date.strftime('%d.%m') if deadline_date else '-',
-            'Заказ': f"{order_qty} шт",
-            'Статус': status
-        })
-        
-        img_path = plot_inventory_projection(hist_dates, hist_stock_vals, dates, stocks, name, lead_time, deadline_date)
-        graphs.append({'name': name, 'cat': category, 'img': img_path, 'status': status})
-
-    # ГЕНЕРАЦИЯ PDF
-    if not os.path.exists(REPORTS_DIR):
-        os.makedirs(REPORTS_DIR)
-        
-    now = datetime.now()
-    doc_filename = f"Report_{now.strftime('%d_%m_%Y_%H_%M_%S')}.pdf"
-    doc_path = os.path.join(REPORTS_DIR, doc_filename)
-    
-    doc = SimpleDocTemplate(doc_path, pagesize=landscape(letter), topMargin=20, bottomMargin=20)
-    elements = []
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='CustomTitle', fontName=font_name, fontSize=18, spaceAfter=20, alignment=1, textColor=colors.HexColor('#2c3e50')))
-    styles['Normal'].fontName = font_name
-
-    elements.append(Paragraph(f"ОТЧЕТ ПО ПОПОЛНЕНИЮ ЗАПАСОВ (LSTM ПРОГНОЗ)", styles['CustomTitle']))
-    elements.append(Paragraph(f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M')} | Период прогноза: 30 дней", styles['Normal']))
-    elements.append(Spacer(1, 0.2*inch))
-    
-    df_rec = pd.DataFrame(recommendations)
-    table_data = [df_rec.columns.tolist()] + df_rec.values.tolist()
-    
-    # Фиксированные ширины колонок для ландшафтной ориентации
-    col_widths = [1.2*inch, 2.2*inch, 0.8*inch, 1.0*inch, 1.0*inch, 1.0*inch, 1.2*inch]
-    t = Table(table_data, colWidths=col_widths, repeatRows=1)
-    
-    style_list = [
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#34495e')),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-        ('FONTNAME', (0,0), (-1,-1), font_name),
-        ('FONTSIZE', (0,0), (-1,-1), 10),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-        ('TOPPADDING', (0,0), (-1,-1), 8),
-    ]
-    
-    for idx in range(len(df_rec)):
-        row_idx = idx + 1
-        st = df_rec.iloc[idx]['Статус']
-        if st == 'КРИТИЧНО':
-            style_list.append(('BACKGROUND', (0, row_idx), (-1, row_idx), colors.HexColor('#fdeaea')))
-            style_list.append(('TEXTCOLOR', (6, row_idx), (6, row_idx), colors.red))
-        elif st == 'ПЛАНОВАЯ':
-            style_list.append(('BACKGROUND', (0, row_idx), (-1, row_idx), colors.HexColor('#fff9e6')))
-            
-    t.setStyle(TableStyle(style_list))
-    elements.append(t)
-    elements.append(PageBreak())
-    
-    # Секция с графиками
-    elements.append(Paragraph("ДЕТАЛИЗАЦИЯ ПО ТОВАРАМ", styles['CustomTitle']))
-    
-    img_table_data = []
-    row = []
-    for g in graphs:
-        # Увеличиваем размер графиков для лучшей читаемости
-        img = Image(g['img'], width=4.8*inch, height=2.4*inch)
-        row.append(img)
-        if len(row) == 2:
-            img_table_data.append(row)
-            row = []
-    if row:
-        img_table_data.append(row + [''])
-        
-    img_t = Table(img_table_data, colWidths=[5*inch, 5*inch])
-    elements.append(img_t)
-
-    doc.build(elements)
-    print(f"Обновленный отчет сформирован: {doc_path}")
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
