@@ -5,11 +5,11 @@ import recommender
 
 def main():
     print("="*80)
-    print("Запуск пайплайна прогнозирования (Архитектура: LSTM + Экзогенные признаки)")
+    print("Запуск системы прогнозирования спроса (Multi-Model Comparison: LSTM, GRU, Transformer, ARIMA)")
     print("="*80)
     
     # --- Этап 1: Инфраструктура данных ---
-    print("\n[ШАГ 1] Проверка базы данных...")
+    print("\n[ШАГ 1] Подготовка данных и восстановление OOS...")
     if not os.path.exists(data_generator.DB_NAME):
         data_generator.main()
     else:
